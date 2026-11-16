@@ -13,6 +13,10 @@ on:
         description: "Only report what would happen, change nothing"
         type: boolean
         default: true
+      weekly_refresh:
+        description: "Merge the base branch into every pull request that is behind"
+        type: boolean
+        default: false
 
 # The workflow token can only commit the state file to this repository. It
 # cannot comment, open issues or touch pull requests anywhere.
@@ -76,6 +80,7 @@ jobs:
           GIT_NAME: ${{ vars.GIT_NAME || 'mesutoezdil' }}
           GIT_EMAIL: ${{ vars.GIT_EMAIL || 'mesudozdil@gmail.com' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+          WEEKLY_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.weekly_refresh && 'true' || 'false' }}
         run: ./sync.sh
 
       - name: Save state

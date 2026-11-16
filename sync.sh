@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Keeps every open pull request of PR_AUTHOR level with its base branch.
+# Keeps the open pull requests of PR_AUTHOR mergeable with their base branch,
+# and touches a pull request only when it needs it.
 #
 # A clean merge of the base branch is pushed as is. A merge with conflicts, or
 # checks that fail on the pull request, go to a coding agent. Its result is
@@ -11,14 +12,24 @@ set -uo pipefail
 DRY_RUN=${DRY_RUN:-false}
 # PR_FILTER limits the run to pull request URLs that match this regex.
 AGENT_TIMEOUT=${AGENT_TIMEOUT:-45m}
+# A pull request that is behind is merged with its base branch only when it
+# has conflicts or its repository requires an up to date branch. Once a week,
+# in the first run on Sunday (Europe/Berlin), every pull request that is
+# behind is merged, so none drifts far behind. WEEKLY_REFRESH=true forces it.
+WEEKLY_REFRESH=${WEEKLY_REFRESH:-false}
 ROOT=$(pwd)
 WORK=${RUNNER_TEMP:-/tmp}/pr-sync-work
 STATE=$ROOT/state/attempted.txt
+WEEKLY_STATE=$ROOT/state/weekly.txt
 PROBLEMS=$ROOT/problems.md
 SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
 
 mkdir -p "$WORK" "$(dirname "$STATE")"
-touch "$STATE"
+touch "$STATE" "$WEEKLY_STATE"
+TODAY=$(TZ=Europe/Berlin date +%F)
+if [ "$(TZ=Europe/Berlin date +%u)" = 7 ] && ! grep -qxF "$TODAY" "$WEEKLY_STATE"; then
+  WEEKLY_REFRESH=true
+fi
 : > "$PROBLEMS"
 
 git config --global user.name "$GIT_NAME"
@@ -90,8 +101,8 @@ verify_result() {
 
 sync_pr() {
   local url=$1 info number head_owner head_repo head_sha base_slug key dir
-  local action changed=false behind conflicts failing start reason
-  info=$(gh pr view "$url" --json number,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName) || {
+  local action behind conflicts failing start reason merge_state task
+  info=$(gh pr view "$url" --json number,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,mergeStateStatus) || {
     problem "- $url: could not read the pull request"
     return
   }
@@ -99,6 +110,7 @@ sync_pr() {
   head_owner=$(jq -r .headRepositoryOwner.login <<< "$info")
   head_repo=$(jq -r .headRepository.name <<< "$info")
   head_sha=$(jq -r .headRefOid <<< "$info")
+  merge_state=$(jq -r .mergeStateStatus <<< "$info")
   export PR_URL=$url
   HEAD_REF=$(jq -r .headRefName <<< "$info")
   BASE_REF=$(jq -r .baseRefName <<< "$info")
@@ -132,27 +144,76 @@ sync_pr() {
     return
   fi
 
-  if git merge-base --is-ancestor "upstream/$BASE_REF" HEAD; then
-    action="level with $BASE_REF"
-  else
-    behind=$(git rev-list --count "HEAD..upstream/$BASE_REF")
-    if [ "$DRY_RUN" = true ]; then
-      if git merge -q --no-ff --no-commit "upstream/$BASE_REF" > /dev/null 2>&1; then
-        action="would merge $behind commits"
-      else
-        action="would resolve conflicts, $behind commits behind"
-      fi
+  # Decide whether the pull request needs anything. Being behind alone is not
+  # a reason: most repositories merge a branch that is behind, and every push
+  # notifies maintainers and may wait for a new CI approval.
+  behind=$(git rev-list --count "HEAD..upstream/$BASE_REF")
+  local reasons=() conflicted=false fix_checks=false days=0 oldest
+  if [ "$behind" -gt 0 ]; then
+    if git merge -q --no-ff --no-commit "upstream/$BASE_REF" > /dev/null 2>&1; then
       git merge --abort 2> /dev/null || true
-    elif git merge -q --no-ff --signoff -m "Merge branch '$BASE_REF' into $HEAD_REF" "upstream/$BASE_REF"; then
+    else
+      git merge --abort 2> /dev/null || true
+      conflicted=true
+      reasons+=("conflicts")
+    fi
+    if [ "$merge_state" = BEHIND ]; then
+      reasons+=("the base branch requires an up to date branch")
+    fi
+    if [ "$WEEKLY_REFRESH" = true ]; then
+      reasons+=("weekly refresh")
+    fi
+    oldest=$(git log --reverse --format=%ct "HEAD..upstream/$BASE_REF" | head -1)
+    days=$(( ($(date +%s) - oldest) / 86400 ))
+  fi
+  # Checks that fail on the current head may come from the base branch moving.
+  # Each head commit gets one attempt, recorded in the state file.
+  failing=$(gh pr checks "$url" --json name,bucket --jq '[.[] | select(.bucket == "fail") | .name] | join(", ")' 2> /dev/null || true)
+  if [ -n "$failing" ] && ! grep -qxF "$key@$head_sha" "$STATE"; then
+    fix_checks=true
+  fi
+
+  local why=""
+  if [ "${#reasons[@]}" -gt 0 ]; then
+    why=$(printf '%s, ' "${reasons[@]}")
+    why=${why%, }
+  fi
+  if [ "${#reasons[@]}" -eq 0 ] && [ "$fix_checks" != true ]; then
+    if [ "$behind" -eq 0 ]; then
+      report "- $key: level with $BASE_REF"
+    else
+      report "- $key: $behind commits behind for $days days, nothing needed"
+    fi
+    return
+  fi
+  if [ "$DRY_RUN" = true ]; then
+    action="would"
+    if [ "$conflicted" = true ]; then
+      action="$action resolve conflicts and merge $behind commits ($why)"
+    elif [ "${#reasons[@]}" -gt 0 ]; then
+      action="$action merge $behind commits ($why)"
+    fi
+    if [ "$fix_checks" = true ]; then
+      [ "$action" = would ] || action="$action, and"
+      action="$action look at failing checks: $failing"
+    fi
+    report "- $key: $action"
+    return
+  fi
+
+  # Fixing failing checks starts from the current base branch, so it merges the
+  # base branch too. That merge is kept only if a fix is committed on top or
+  # one of the reasons above needs it.
+  action=""
+  if [ "$behind" -gt 0 ]; then
+    if git merge -q --no-ff --signoff -m "Merge branch '$BASE_REF' into $HEAD_REF" "upstream/$BASE_REF"; then
       action="merged $behind commits"
-      changed=true
     else
       conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
       task="A merge of upstream/$BASE_REF into this branch is in progress and has conflicts in: $conflicts
 Resolve every conflict. Read what the pull request changes (gh pr diff $url) and what the base branch changed in each conflicting file (git log -p HEAD..upstream/$BASE_REF -- <file>). Keep the base branch's new code and apply the pull request's change on top of it. Then build and run the tests for the code the pull request touches, fix anything the merge broke, and finish the merge with git commit -s --no-edit."
       if run_agent "$dir" "$task" && reason=$(verify_result "$head_sha"); then
         action="resolved conflicts in $conflicts"
-        changed=true
       else
         git merge --abort 2> /dev/null || true
         git reset -q --hard "$head_sha"
@@ -160,35 +221,32 @@ Resolve every conflict. Read what the pull request changes (gh pr diff $url) and
         return
       fi
     fi
+    [ -z "$why" ] || action="$action ($why)"
   fi
 
-  # Update: checks that fail on the current head may come from the base branch
-  # moving. Each head commit gets one attempt, recorded in the state file.
-  failing=$(gh pr checks "$url" --json name,bucket --jq '[.[] | select(.bucket == "fail") | .name] | join(", ")' 2> /dev/null || true)
-  if [ -n "$failing" ] && ! grep -qxF "$key@$head_sha" "$STATE"; then
-    if [ "$DRY_RUN" = true ]; then
-      action="$action; would look at failing checks: $failing"
-    else
-      start=$(git rev-parse HEAD)
-      task="These checks fail on the pull request: $failing
+  if [ "$fix_checks" = true ]; then
+    start=$(git rev-parse HEAD)
+    task="These checks fail on the pull request: $failing
 Find out why with gh pr checks $url and gh run view <run id> --log-failed -R $base_slug. If a failure comes from the pull request's code, or from the base branch having moved (a renamed API, generated files out of date, a new lint rule, a broken test), fix it with the smallest change, run the related build and tests, and commit. If a failure is unrelated to the code (a flaky test, infrastructure, missing secrets, a workflow waiting for approval), change nothing."
-      if run_agent "$dir" "$task" && reason=$(verify_result "$start"); then
-        if [ "$(git rev-parse HEAD)" != "$start" ]; then
-          action="$action; fixed failing checks: $failing"
-          changed=true
-        else
-          action="$action; failing checks need no change: $failing"
-        fi
+    if run_agent "$dir" "$task" && reason=$(verify_result "$start"); then
+      if [ "$(git rev-parse HEAD)" != "$start" ]; then
+        action="${action:+$action; }fixed failing checks: $failing"
+      elif [ "${#reasons[@]}" -eq 0 ]; then
+        git reset -q --hard "$head_sha"
+        action="failing checks need no change: $failing"
       else
-        git reset -q --hard "$start"
-        problem "- $key: could not handle failing checks ($failing) ${reason:-}"
+        action="$action; failing checks need no change: $failing"
       fi
-      echo "$key@$head_sha" >> "$STATE"
+    else
+      git reset -q --hard "$start"
+      [ "${#reasons[@]}" -gt 0 ] || git reset -q --hard "$head_sha"
+      problem "- $key: could not handle failing checks ($failing) ${reason:-}"
     fi
+    echo "$key@$head_sha" >> "$STATE"
   fi
 
-  if [ "$changed" != true ]; then
-    report "- $key: $action"
+  if [ "$(git rev-parse HEAD)" = "$head_sha" ]; then
+    report "- $key: ${action:-nothing to push}"
     return
   fi
   if ! git -c "$auth" push -q origin "HEAD:$HEAD_REF"; then
@@ -198,7 +256,7 @@ Find out why with gh pr checks $url and gh run view <run id> --log-failed -R $ba
   report "- $key: $action, pushed $(git rev-parse --short HEAD)"
 }
 
-report "## Pull requests of $PR_AUTHOR (dry run: $DRY_RUN)"
+report "## Pull requests of $PR_AUTHOR (dry run: $DRY_RUN, weekly refresh: $WEEKLY_REFRESH)"
 urls=$(gh search prs --author "$PR_AUTHOR" --state open --limit 200 --json url --jq '.[].url' | sort | grep -E "${PR_FILTER:-.}") || {
   problem "- could not list the pull requests"
   exit 1
@@ -206,3 +264,6 @@ urls=$(gh search prs --author "$PR_AUTHOR" --state open --limit 200 --json url -
 for url in $urls; do
   (sync_pr "$url")
 done
+if [ "$DRY_RUN" != true ] && [ "$WEEKLY_REFRESH" = true ] && [ "$(TZ=Europe/Berlin date +%u)" = 7 ]; then
+  echo "$TODAY" >> "$WEEKLY_STATE"
+fi
