@@ -14,9 +14,10 @@ on:
         type: boolean
         default: true
 
+# The workflow token can only commit the state file to this repository. It
+# cannot comment, open issues or touch pull requests anywhere.
 permissions:
   contents: write
-  issues: write
 
 concurrency:
   group: pr-sync
@@ -88,17 +89,10 @@ jobs:
             git push -q
           fi
 
-      - name: Report problems
+      - name: Fail when something needs a look
         if: always() && steps.gate.outputs.run == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
+          # A failed run sends the usual GitHub Actions email. Nothing is posted.
           [ -s problems.md ] || exit 0
-          title="pr-sync problems"
-          body=$(printf 'Run: %s/%s/actions/runs/%s\n\n%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$(cat problems.md)")
-          number=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
-          if [ -n "$number" ]; then
-            gh issue edit "$number" -R "$GITHUB_REPOSITORY" --body "$body"
-          else
-            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
-          fi
+          cat problems.md
+          exit 1
