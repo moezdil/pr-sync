@@ -1,0 +1,104 @@
+name: pr-sync
+
+on:
+  schedule:
+    # 16:00, 18:00 and 20:00 in Europe/Berlin. GitHub runs cron in UTC, so one
+    # line is for winter time (UTC+1) and one for summer time (UTC+2). The gate
+    # step below runs only the line that matches the current Berlin offset.
+    - cron: "7 15,17,19 * * *"
+    - cron: "7 14,16,18 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only report what would happen, change nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: pr-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Check the Berlin time
+        id: gate
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          offset=$(TZ=Europe/Berlin date +%z)
+          run=true
+          if [ -n "$SCHEDULE" ]; then
+            case "$offset|$SCHEDULE" in
+              "+0100|7 15,17,19 * * *" | "+0200|7 14,16,18 * * *") run=true ;;
+              *) run=false ;;
+            esac
+          fi
+          echo "Berlin offset $offset, schedule '$SCHEDULE', run=$run"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.run == 'true'
+
+      - name: Install tools
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          npm install -g opencode-ai@1.19.5
+          python3 -m pip install --user --quiet uv
+          corepack enable
+
+      - name: Restore the model login
+        if: steps.gate.outputs.run == 'true'
+        env:
+          OPENCODE_AUTH: ${{ secrets.OPENCODE_AUTH }}
+        run: |
+          mkdir -p ~/.local/share/opencode
+          umask 077
+          printf '%s' "$OPENCODE_AUTH" > ~/.local/share/opencode/auth.json
+
+      - name: Sync pull requests
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PR_SYNC_TOKEN }}
+          PR_SYNC_TOKEN: ${{ secrets.PR_SYNC_TOKEN }}
+          # The agent reads GitHub with the workflow token, which cannot push
+          # to the forks or write to other repositories.
+          AGENT_GH_TOKEN: ${{ github.token }}
+          OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL }}
+          PR_AUTHOR: ${{ vars.PR_AUTHOR || 'moezdil' }}
+          GIT_NAME: ${{ vars.GIT_NAME || 'mesutoezdil' }}
+          GIT_EMAIL: ${{ vars.GIT_EMAIL || 'mesudozdil@gmail.com' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+        run: ./sync.sh
+
+      - name: Save state
+        if: always() && steps.gate.outputs.run == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state
+          if ! git diff --cached --quiet; then
+            git commit -q -m "Update pr-sync state"
+            git push -q
+          fi
+
+      - name: Report problems
+        if: always() && steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -s problems.md ] || exit 0
+          title="pr-sync problems"
+          body=$(printf 'Run: %s/%s/actions/runs/%s\n\n%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$(cat problems.md)")
+          number=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue edit "$number" -R "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
