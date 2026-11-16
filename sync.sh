@@ -48,7 +48,8 @@ run_agent() {
   prompt=$(TASK=$task envsubst '${PR_URL} ${BASE_REF} ${HEAD_REF} ${TASK}' < "$ROOT/prompt.md")
   (
     cd "$dir" || exit 1
-    GH_TOKEN=${AGENT_GH_TOKEN:-} timeout "$AGENT_TIMEOUT" \
+    # The push token is removed from the agent's environment.
+    env -u PR_SYNC_TOKEN GH_TOKEN="${AGENT_GH_TOKEN:-}" timeout "$AGENT_TIMEOUT" \
       opencode run --pure --auto --model "$OPENCODE_MODEL" "$prompt"
   )
 }
