@@ -1,2 +1,3 @@
 moezdil/siltide#191@ab4181259ba4f887388ee72fece4ff0356e5d4c6
 lfedgeai/SPEAR#102@2fd46dce279a8a5df33bac66aea481076f758748
+vllm-project/vllm-omni#9594@252176fdb409165f7c3c299beec12c360f6a609a
